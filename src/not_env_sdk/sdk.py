@@ -59,13 +59,16 @@ class NotEnvSDK:
                         f"Failed to fetch variables: {response.status} - {response.reason}"
                     )
                 data = json.loads(response.read().decode("utf-8"))
-                # Assuming the API returns a dict or list of dicts with key/value pairs
-                # Adjust based on actual API response format
-                if isinstance(data, dict):
-                    return data
+                # Handle the actual API response format: {"variables": [{"key": "...", "value": "..."}]}
+                if isinstance(data, dict) and "variables" in data:
+                    # API returns {"variables": [{"key": "...", "value": "..."}]}
+                    return {item["key"]: item["value"] for item in data["variables"]}
                 elif isinstance(data, list):
                     # If it's a list of {key: ..., value: ...} objects
                     return {item["key"]: item["value"] for item in data}
+                elif isinstance(data, dict):
+                    # Fallback: if it's a plain dict, return as-is
+                    return data
                 else:
                     raise RuntimeError(f"Unexpected response format: {type(data)}")
         except urllib.error.HTTPError as e:
