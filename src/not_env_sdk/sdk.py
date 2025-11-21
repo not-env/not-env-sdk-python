@@ -4,7 +4,7 @@ Core SDK implementation for not-env Python SDK.
 
 import os
 import sys
-from typing import Dict, Optional
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 import urllib.request
 import urllib.error
 import json
@@ -30,13 +30,24 @@ class NotEnvSDK:
         self._preserved_keys = {"NOT_ENV_URL", "NOT_ENV_API_KEY"}
 
         if not self._url:
-            raise ValueError("NOT_ENV_URL environment variable is required")
+            raise ValueError(
+                "NOT_ENV_URL environment variable is required. "
+                "Set NOT_ENV_URL and NOT_ENV_API_KEY environment variables. "
+                "Get your API key from 'not-env env import' or 'not-env env create' output."
+            )
         if not self._api_key:
-            raise ValueError("NOT_ENV_API_KEY environment variable is required")
+            raise ValueError(
+                "NOT_ENV_API_KEY environment variable is required. "
+                "Set NOT_ENV_URL and NOT_ENV_API_KEY environment variables. "
+                "Get your API key from 'not-env env import' or 'not-env env create' output."
+            )
 
     def fetch_variables(self) -> Dict[str, str]:
         """
-        Fetch all variables from the not-env backend.
+        Fetch all variables from the not-env backend synchronously.
+        
+        This method blocks until the HTTP request completes, ensuring variables
+        are loaded before os.environ is patched.
 
         Returns:
             Dictionary of variable names to values
@@ -53,11 +64,22 @@ class NotEnvSDK:
         req.add_header("Content-Type", "application/json")
 
         try:
-            with urllib.request.urlopen(req) as response:
+            # urllib.request.urlopen() is synchronous - it blocks until the request completes
+            # Timeout matches JavaScript SDK (30 seconds)
+            with urllib.request.urlopen(req, timeout=30) as response:
                 if response.status != 200:
-                    raise RuntimeError(
-                        f"Failed to fetch variables: {response.status} - {response.reason}"
-                    )
+                    # Try to parse error response
+                    try:
+                        error_body = response.read().decode("utf-8")
+                        error_data = json.loads(error_body)
+                        error_msg = error_data.get("message", "")
+                        raise RuntimeError(
+                            f"Failed to fetch variables: {response.status} - {error_msg}"
+                        )
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        raise RuntimeError(
+                            f"Failed to fetch variables: {response.status} - {response.reason}"
+                        )
                 data = json.loads(response.read().decode("utf-8"))
                 # Handle the actual API response format: {"variables": [{"key": "...", "value": "..."}]}
                 if isinstance(data, dict) and "variables" in data:
@@ -72,19 +94,36 @@ class NotEnvSDK:
                 else:
                     raise RuntimeError(f"Unexpected response format: {type(data)}")
         except urllib.error.HTTPError as e:
-            raise RuntimeError(
-                f"Failed to fetch variables: {e.code} - {e.reason}"
-            ) from e
+            # Try to parse error response body
+            try:
+                error_body = e.read().decode("utf-8")
+                error_data = json.loads(error_body)
+                error_msg = error_data.get("message", e.reason)
+                raise RuntimeError(
+                    f"Failed to fetch variables: {e.code} - {error_msg}"
+                ) from e
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                raise RuntimeError(
+                    f"Failed to fetch variables: {e.code} - {e.reason}"
+                ) from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"Request failed: {e.reason}") from e
+        except TimeoutError as e:
+            raise RuntimeError("Request timeout: Failed to fetch variables within 30 seconds") from e
 
     def initialize(self) -> None:
         """
         Initialize the SDK by fetching variables and patching os.environ.
+        
+        This method is synchronous and blocks until variables are fetched.
+        os.environ is only patched after variables are successfully loaded.
         """
+        # Fetch variables synchronously (blocks until complete)
         self._variables = self.fetch_variables()
 
         # Create a custom dict-like class that intercepts access to os.environ
+        # This class provides hermetic behavior: only variables from not-env are available
+        # NOT_ENV_URL and NOT_ENV_API_KEY are preserved from the original environment
         class PatchedEnviron:
             def __init__(self, sdk_instance):
                 self._sdk = sdk_instance
@@ -131,20 +170,20 @@ class NotEnvSDK:
                     return key in self._sdk._original_environ
                 return key in self._sdk._variables
 
-            def __iter__(self):
-                # Return iterator over all keys (not-env + preserved)
+            def __iter__(self) -> Iterator[str]:
+                """Return iterator over all keys (not-env + preserved)."""
                 return iter(self._all_keys)
 
-            def keys(self):
-                """Return a dict_keys view of all keys."""
+            def keys(self) -> set:
+                """Return a set-like view of all keys."""
                 return self._all_keys
 
-            def values(self):
-                """Return a dict_values view of all values."""
+            def values(self) -> List[str]:
+                """Return a list of all values."""
                 return [self[k] for k in self._all_keys]
 
-            def items(self):
-                """Return a dict_items view of all key-value pairs."""
+            def items(self) -> List[Tuple[str, str]]:
+                """Return a list of all key-value pairs."""
                 return [(k, self[k]) for k in self._all_keys]
 
             def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -171,19 +210,19 @@ class NotEnvSDK:
                     "Cannot pop environment variables. Variables are managed by not-env."
                 )
 
-            def popitem(self):
+            def popitem(self) -> Tuple[str, str]:
                 """Popitem is not allowed (hermetic behavior)."""
                 raise RuntimeError(
                     "Cannot pop environment variables. Variables are managed by not-env."
                 )
 
-            def update(self, *args, **kwargs):
+            def update(self, *args, **kwargs) -> None:
                 """Update is not allowed (hermetic behavior)."""
                 raise RuntimeError(
                     "Cannot update environment variables. Variables are managed by not-env."
                 )
 
-            def clear(self):
+            def clear(self) -> None:
                 """Clear is not allowed (hermetic behavior)."""
                 raise RuntimeError(
                     "Cannot clear environment variables. Variables are managed by not-env."
@@ -201,9 +240,11 @@ class NotEnvSDK:
 
 def initialize(url: Optional[str] = None, api_key: Optional[str] = None) -> None:
     """
-    Initialize the not-env SDK.
+    Initialize the not-env SDK synchronously.
 
     This function fetches variables from not-env and patches os.environ.
+    The function blocks until variables are loaded, ensuring they are available
+    before any code can access os.environ.
 
     Args:
         url: Backend URL (defaults to NOT_ENV_URL env var)
@@ -215,8 +256,9 @@ def initialize(url: Optional[str] = None, api_key: Optional[str] = None) -> None
     """
     sdk = NotEnvSDK(url=url, api_key=api_key)
     try:
+        # Initialize synchronously - blocks until variables are loaded
         sdk.initialize()
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Failed to initialize not-env-sdk: {e}", file=sys.stderr)
         sys.exit(1)
 
